@@ -1,0 +1,7 @@
+bridge.log
+bridge_history.db
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.env
