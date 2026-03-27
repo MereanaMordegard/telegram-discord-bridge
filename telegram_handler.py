@@ -11,6 +11,7 @@ from telegram.ext import (
 from telegram.error import TelegramError, RetryAfter, TimedOut
 import asyncio
 import io
+import html
 from typing import Optional
 from logger import get_logger
 from config import config
@@ -465,9 +466,9 @@ class TelegramHandler:
             # Иначе стандартная отправка в Discord-тред (для обратной совместимости)
             # Формируем текст с префиксом (указываем канал)
             if text:
-                formatted_text = f"[#{channel_name}] {username}: {text}"
+                formatted_text = f"[#{html.escape(channel_name)}] {html.escape(username)}: {html.escape(text)}"
             else:
-                formatted_text = f"[#{channel_name}] {username}:"
+                formatted_text = f"[#{html.escape(channel_name)}] {html.escape(username)}:"
 
             # Обрезаем если слишком длинное
             if len(formatted_text) > config.MAX_MESSAGE_LENGTH:
@@ -516,7 +517,7 @@ class TelegramHandler:
             # Повторная попытка без медиа (только текст)
             try:
                 if text:
-                    await self._send_text(f"[Discord] {username}: {text}")
+                    await self._send_text(f"[Discord] {html.escape(username)}: {html.escape(text)}")
                     logger.info("✅ Сообщение отправлено после повтора (без медиа)")
             except Exception as retry_error:
                 logger.error(f"❌ Повторная попытка не удалась: {retry_error}")
@@ -534,7 +535,8 @@ class TelegramHandler:
         return await self.bot.send_message(
             chat_id=config.TELEGRAM_CHAT_ID,
             text=text,
-            message_thread_id=config.TELEGRAM_THREAD_ID
+            message_thread_id=config.TELEGRAM_THREAD_ID,
+            parse_mode='HTML'
         )
 
     async def _send_media(self, caption: str, media_info: dict):
@@ -556,28 +558,32 @@ class TelegramHandler:
                 chat_id=config.TELEGRAM_CHAT_ID,
                 photo=file_obj,
                 caption=caption,
-                message_thread_id=config.TELEGRAM_THREAD_ID
+                message_thread_id=config.TELEGRAM_THREAD_ID,
+                parse_mode='HTML'
             )
         elif media_type == 'video':
             return await self.bot.send_video(
                 chat_id=config.TELEGRAM_CHAT_ID,
                 video=file_obj,
                 caption=caption,
-                message_thread_id=config.TELEGRAM_THREAD_ID
+                message_thread_id=config.TELEGRAM_THREAD_ID,
+                parse_mode='HTML'
             )
         elif media_type == 'audio':
             return await self.bot.send_audio(
                 chat_id=config.TELEGRAM_CHAT_ID,
                 audio=file_obj,
                 caption=caption,
-                message_thread_id=config.TELEGRAM_THREAD_ID
+                message_thread_id=config.TELEGRAM_THREAD_ID,
+                parse_mode='HTML'
             )
         else:  # document
             return await self.bot.send_document(
                 chat_id=config.TELEGRAM_CHAT_ID,
                 document=file_obj,
                 caption=caption,
-                message_thread_id=config.TELEGRAM_THREAD_ID
+                message_thread_id=config.TELEGRAM_THREAD_ID,
+                parse_mode='HTML'
             )
 
     async def send_message_to_thread(
@@ -609,10 +615,13 @@ class TelegramHandler:
             logger.debug(f"🔍 DEBUG: source={source}")
 
             # Формируем текст с префиксом
+            safe_username = html.escape(username)
             if text:
-                formatted_text = f"[{source}] {username}: {text}"
+                # Если текст уже содержит HTML-разметку (blockquote) — не экранируем
+                safe_text = text if '<blockquote>' in text else html.escape(text)
+                formatted_text = f"[{source}] {safe_username}: {safe_text}"
             else:
-                formatted_text = f"[{source}] {username}:"
+                formatted_text = f"[{source}] {safe_username}:"
 
             logger.debug(f"🔍 DEBUG: formatted_text={formatted_text[:100]}")
 
@@ -639,8 +648,9 @@ class TelegramHandler:
                 except asyncio.TimeoutError:
                     logger.error("❌ Таймаут отправки медиа (60s)")
                     if text:
+                        safe_text = text if '<blockquote>' in text else html.escape(text)
                         sent_message = await self._send_text_to_thread(
-                            f"[{source}] {username}: {text}\n\n⚠️ (медиафайл не отправлен - таймаут)",
+                            f"[{source}] {html.escape(username)}: {safe_text}\n\n⚠️ (медиафайл не отправлен - таймаут)",
                             thread_id
                         )
             elif text:
@@ -691,7 +701,8 @@ class TelegramHandler:
             result = await self.bot.send_message(
                 chat_id=config.TELEGRAM_CHAT_ID,
                 text=text,
-                message_thread_id=thread_id
+                message_thread_id=thread_id,
+                parse_mode='HTML'
             )
 
             logger.debug(f"✅ _send_text_to_thread SUCCESS: msg_id={result.message_id}")
@@ -717,28 +728,32 @@ class TelegramHandler:
                 chat_id=config.TELEGRAM_CHAT_ID,
                 photo=file_obj,
                 caption=caption,
-                message_thread_id=thread_id
+                message_thread_id=thread_id,
+                parse_mode='HTML'
             )
         elif media_type == 'video':
             return await self.bot.send_video(
                 chat_id=config.TELEGRAM_CHAT_ID,
                 video=file_obj,
                 caption=caption,
-                message_thread_id=thread_id
+                message_thread_id=thread_id,
+                parse_mode='HTML'
             )
         elif media_type == 'audio':
             return await self.bot.send_audio(
                 chat_id=config.TELEGRAM_CHAT_ID,
                 audio=file_obj,
                 caption=caption,
-                message_thread_id=thread_id
+                message_thread_id=thread_id,
+                parse_mode='HTML'
             )
         else:  # document
             return await self.bot.send_document(
                 chat_id=config.TELEGRAM_CHAT_ID,
                 document=file_obj,
                 caption=caption,
-                message_thread_id=thread_id
+                message_thread_id=thread_id,
+                parse_mode='HTML'
             )
 
     async def start(self):

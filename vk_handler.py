@@ -6,7 +6,10 @@ from vk_api.bot_longpoll import VkBotLongPoll, VkBotEventType
 from vk_api.utils import get_random_id
 import asyncio
 import io
+import html
 import requests
+import json
+import os
 from typing import Optional
 from logger import get_logger
 from config import config
@@ -20,6 +23,10 @@ from vk_thread_mapping import (
     is_thread_synced
 )
 from vk_thread_mapping import get_vk_peer_id as _get_vk_peer_id
+
+CATCH_UP_STATE_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "vk_catchup_state.json"
+)
 
 logger = get_logger(__name__)
 
@@ -36,6 +43,183 @@ class VKHandler:
         self.queue = MessageQueue()
         self.processed_ids = set()
         self.max_processed_ids = 5000
+        self._heartbeat = "__heartbeat__"
+        self._catchup_state = self._load_catchup_state()
+
+    # ─── Catch-up state persistence ──────────────────────────────────
+
+    def _load_catchup_state(self) -> dict:
+        """Загрузка { "<peer_id>": <last_conversation_message_id> }"""
+        try:
+            if os.path.exists(CATCH_UP_STATE_FILE):
+                with open(CATCH_UP_STATE_FILE, "r") as f:
+                    state = json.load(f)
+                logger.info(f"📂 Catch-up state загружен: {len(state)} бесед")
+                return state
+        except Exception as e:
+            logger.error(f"❌ Ошибка загрузки catch-up state: {e}")
+        return {}
+
+    def _save_catchup_state(self):
+        tmp = CATCH_UP_STATE_FILE + ".tmp"
+        try:
+            with open(tmp, "w") as f:
+                json.dump(self._catchup_state, f)
+            os.replace(tmp, CATCH_UP_STATE_FILE)
+        except Exception as e:
+            logger.error(f"❌ Ошибка сохранения catch-up state: {e}")
+
+    def _update_catchup_id(self, peer_id: int, cmid: int):
+        key = str(peer_id)
+        if cmid > self._catchup_state.get(key, 0):
+            self._catchup_state[key] = cmid
+            self._save_catchup_state()
+
+    # ─── Catch-up: догнать пропущенные сообщения ─────────────────────
+
+    async def _catch_up_missed_messages(self):
+        from vk_thread_mapping import VK_TO_THREAD
+
+        peer_ids = set(VK_TO_THREAD.keys())
+
+        if not peer_ids:
+            return
+
+        total = 0
+        for peer_id in peer_ids:
+            try:
+                last_cmid = self._catchup_state.get(str(peer_id), 0)
+                if last_cmid == 0:
+                    await self._init_catchup_position(peer_id)
+                    continue
+                total += await self._fetch_and_forward_missed(peer_id, last_cmid)
+            except Exception as e:
+                logger.error(f"❌ Catch-up peer_id={peer_id}: {e}", exc_info=True)
+
+        logger.info(f"✅ Catch-up завершён: переслано {total} сообщений")
+
+    async def _init_catchup_position(self, peer_id: int):
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None,
+            lambda: self.vk_api.messages.getHistory(peer_id=peer_id, count=1)
+        )
+        items = result.get("items", [])
+        if items:
+            cmid = items[0].get("conversation_message_id", items[0]["id"])
+            self._update_catchup_id(peer_id, cmid)
+            logger.info(f"📌 Catch-up init peer_id={peer_id}: last_cmid={cmid}")
+
+    async def _fetch_and_forward_missed(self, peer_id: int, last_cmid: int) -> int:
+        loop = asyncio.get_event_loop()
+        MAX_FETCH = 200
+        all_missed = []
+        offset = 0
+
+        while offset < MAX_FETCH:
+            result = await loop.run_in_executor(
+                None,
+                lambda off=offset: self.vk_api.messages.getHistory(
+                    peer_id=peer_id, count=min(200, MAX_FETCH - offset), offset=off
+                )
+            )
+            items = result.get("items", [])
+            if not items:
+                break
+
+            found_boundary = False
+            for msg in items:
+                cmid = msg.get("conversation_message_id", msg["id"])
+                if cmid <= last_cmid:
+                    found_boundary = True
+                    break
+                all_missed.append(msg)
+
+            if found_boundary:
+                break
+            offset += len(items)
+            await asyncio.sleep(0.35)
+
+        if not all_missed:
+            return 0
+
+        all_missed.reverse()  # хронологический порядок
+
+        thread_id = get_telegram_thread_id(peer_id)
+        if not thread_id:
+            return 0
+
+        logger.info(f"📨 Catch-up peer_id={peer_id}: {len(all_missed)} пропущенных")
+
+        forwarded = 0
+        for msg in all_missed:
+            try:
+                from_id = msg.get("from_id", 0)
+                cmid = msg.get("conversation_message_id", msg["id"])
+                dedup_key = f"{peer_id}_{cmid}"
+
+                if from_id < 0 or dedup_key in self.processed_ids:
+                    text = msg.get("text", "")
+                    if text.startswith("[TG] "):
+                        self._update_catchup_id(peer_id, cmid)
+                        continue
+
+                await self._forward_catchup_message(msg, peer_id, thread_id)
+                self.processed_ids.add(dedup_key)
+                self._update_catchup_id(peer_id, cmid)
+                forwarded += 1
+                await asyncio.sleep(0.5)
+            except Exception as e:
+                logger.error(f"❌ Catch-up forward: {e}", exc_info=True)
+                break
+
+        return forwarded
+
+    async def _forward_catchup_message(self, msg: dict, peer_id: int, thread_id: int):
+        from_id = msg.get("from_id", 0)
+        text = msg.get("text", "")
+        username = await self._get_username(from_id)
+
+        # Reply обработка
+        if msg.get("reply_message"):
+            reply = msg["reply_message"]
+            reply_from_id = reply.get("from_id", 0)
+            reply_user = await self._get_username(reply_from_id) if reply_from_id > 0 else "Бот"
+            reply_text = reply.get("text", "") or "сообщение"
+            if len(reply_text) > 200:
+                reply_text = reply_text[:200] + "..."
+            import re
+            reply_text = re.sub(r'💬\s*.+?:\s*«.*?»\s*\n*', '', reply_text, flags=re.DOTALL).strip()
+            reply_text = re.sub(r'^\[(?:TG|VK|Discord)\]\s*[^:]+:\s*', '', reply_text).strip()
+            if not reply_text:
+                reply_text = "сообщение"
+            text = html.escape(text) if text else ""
+            text = f"💬 {html.escape(reply_user)}:\n<blockquote>{html.escape(reply_text)}</blockquote>\n{text}"
+
+        # Фильтр фото-треда
+        PHOTO_THREAD_ID = 14101
+        if thread_id == PHOTO_THREAD_ID:
+            attachments = msg.get("attachments", [])
+            if not any(a["type"] in ("photo", "video") for a in attachments):
+                return
+
+        # Вложения
+        media_info = await self._process_attachments(msg)
+        if media_info and media_info.get("type") in ("text_extra", "video_link"):
+            extra = media_info.get("text") or ""
+            if media_info.get("type") == "video_link":
+                extra = f"🎬 {media_info['title']}\n{media_info['url']}"
+            text = f"{text}\n\n{extra}" if text else extra
+            media_info = None
+
+        cmid = msg.get("conversation_message_id", msg["id"])
+        await telegram_queue.add(
+            self.telegram_sender.send_message_to_thread,
+            text=text, username=username, thread_id=thread_id,
+            media_info=media_info, source="VK",
+            source_message_id=str(cmid), vk_peer_id=peer_id,
+        )
+        logger.info(f"📨 Catch-up VK→TG ({get_thread_name(thread_id)}): {username}: {(text or '')[:50]}")
 
     async def initialize(self):
         """Инициализация VK бота"""
@@ -62,6 +246,11 @@ class VKHandler:
         self.is_running = True
         logger.info("🚀 VK бот запущен (ASYNC), слушаю события...")
 
+        try:
+            await self._catch_up_missed_messages()
+        except Exception as e:
+            logger.error(f"❌ Catch-up при старте: {e}", exc_info=True)
+
         reconnect_delay = 5
 
         while self.is_running:
@@ -83,6 +272,12 @@ class VKHandler:
                 )
                 logger.info("✅ VK Long Poll переинициализирован")
                 reconnect_delay = 5
+
+                try:
+                    await self._catch_up_missed_messages()
+                except Exception as e:
+                    logger.error(f"❌ Catch-up после реконнекта: {e}", exc_info=True)
+
             except Exception as e:
                 logger.error(f"❌ Ошибка переинициализации: {e}", exc_info=True)
 
@@ -98,10 +293,17 @@ class VKHandler:
         def _poll_thread():
             """Блокирующий поток: слушает VK и кладёт события в очередь"""
             try:
-                for event in self.longpoll.listen():
-                    if not self.is_running:
+                while self.is_running:
+                    try:
+                        for event in self.longpoll.check():
+                            if not self.is_running:
+                                return
+                            loop.call_soon_threadsafe(event_queue.put_nowait, event)
+                        # После каждого check — heartbeat
+                        loop.call_soon_threadsafe(event_queue.put_nowait, "__heartbeat__")
+                    except Exception as e:
+                        loop.call_soon_threadsafe(event_queue.put_nowait, e)
                         return
-                    loop.call_soon_threadsafe(event_queue.put_nowait, event)
             except Exception as e:
                 loop.call_soon_threadsafe(event_queue.put_nowait, e)
 
@@ -111,8 +313,10 @@ class VKHandler:
 
         while self.is_running:
             try:
-                logger.info(f"🔍 _listen_events: жду событие из очереди (qsize={event_queue.qsize()})")
                 item = await asyncio.wait_for(event_queue.get(), timeout=60)
+
+                if item == "__heartbeat__":
+                    continue
 
                 if isinstance(item, Exception):
                     raise item
@@ -131,7 +335,7 @@ class VKHandler:
                         logger.error(f"❌ Ошибка обработки события: {e}", exc_info=True)
 
             except asyncio.TimeoutError:
-                logger.warning("⏰ VK Long Poll: нет событий 60s — переподключение")
+                logger.warning("⏰ VK Long Poll: нет heartbeat 60s — переподключение")
                 raise
             except Exception as e:
                 logger.error(f"❌ Ошибка в цикле Long Poll: {e}", exc_info=True)
@@ -317,7 +521,17 @@ class VKHandler:
                         elif attach_type == 'doc':
                             reply_text = f"📎 {reply_text}"
 
-                text = f"💬 {reply_user}: «{reply_text}»\n\n{text}"
+                import re
+                # Убираем блок "💬 Имя: «текст»\n\n" (старый формат кавычек)
+                reply_text = re.sub(r'💬\s*.+?:\s*«.*?»\s*\n*', '', reply_text, flags=re.DOTALL).strip()
+                # Убираем префикс "[TG] Имя:" или "[VK] Имя:"
+                reply_text = re.sub(r'^\[(?:TG|VK|Discord)\]\s*[^:]+:\s*', '', reply_text).strip()
+
+                if not reply_text:
+                    reply_text = "сообщение"
+
+                text = html.escape(text)
+                text = f"💬 {html.escape(reply_user)}:\n<blockquote>{html.escape(reply_text)}</blockquote>\n{text}"
 
             # Получаем соответствующий Telegram thread
             thread_id = get_telegram_thread_id(peer_id)
@@ -395,6 +609,10 @@ class VKHandler:
                 f"{text[:50]}{'...' if len(text) > 50 else ''}"
             )
             logger.info(f"🔍 _handle_message END: ok")
+
+            cmid = message.get('conversation_message_id', message['id'])
+            self._update_catchup_id(peer_id, cmid)
+
         except Exception as e:
             logger.error(f"❌ Ошибка обработки VK сообщения: {e}", exc_info=True)
             await db.log_error("vk_message_handler", str(e))

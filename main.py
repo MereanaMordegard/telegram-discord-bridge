@@ -6,6 +6,7 @@ import signal
 import sys
 from logger import BridgeLogger, get_logger
 from config import config
+import os
 from database import db
 from telegram_handler import TelegramHandler
 from discord_handler import DiscordHandler
@@ -95,7 +96,39 @@ class BridgeBot:
             #    tasks.append(delete_sync_task)
 
             # Ждём сигнала остановки
-            await self.shutdown_event.wait()
+            # Пингуем watchdog пока бот работает
+            while not self.shutdown_event.is_set():
+
+                # Проверяем что задачи живы
+                failed = False
+                for t in tasks:
+                    if t.done():
+                        exc = t.exception() if not t.cancelled() else None
+                        if exc or t.cancelled():
+                            logger.error(f"❌ Задача умерла: {t.get_name()}: {exc or 'cancelled'}")
+                            failed = True
+                if failed:
+                    break
+
+                # Пингуем systemd watchdog
+                try:
+                    import sdnotify
+                    sdnotify.SystemdNotifier().notify("WATCHDOG=1")
+                except ImportError:
+                    # Fallback без sdnotify
+                    if os.environ.get("WATCHDOG_USEC"):
+                        try:
+                            import socket
+                            addr = os.environ.get("NOTIFY_SOCKET")
+                            if addr:
+                                sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+                                sock.connect(addr)
+                                sock.sendall(b"WATCHDOG=1")
+                                sock.close()
+                        except Exception:
+                            pass
+
+                await asyncio.sleep(30)
 
             logger.info("🛑 Получен сигнал остановки, завершаю работу...")
 

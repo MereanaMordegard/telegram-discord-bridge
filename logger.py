@@ -43,7 +43,7 @@ class BridgeLogger:
         file_handler = RotatingFileHandler(
             self.log_file,
             maxBytes=10 * 1024 * 1024,  # 10MB
-            backupCount=0,
+            backupCount=2,
             encoding='utf-8'
         )
         file_handler.setFormatter(log_format)
@@ -58,6 +58,8 @@ class BridgeLogger:
         logging.getLogger('discord').setLevel(logging.WARNING)
         logging.getLogger('telegram').setLevel(logging.WARNING)
         logging.getLogger('aiohttp').setLevel(logging.WARNING)
+        logging.getLogger('httpx').setLevel(logging.WARNING)
+        logging.getLogger('httpcore').setLevel(logging.WARNING)
 
 
 def get_logger(name: str) -> logging.Logger:
